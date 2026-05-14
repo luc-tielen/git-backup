@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -14,7 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const configPath = "~/.config/git-backup/config.yaml"
+const defaultConfigPath = "~/.config/git-backup/config.yaml"
 
 const placeholderConfig = `backup-dir: ~/backups/git
 repositories:
@@ -29,50 +30,77 @@ type Config struct {
 	Repositories map[string]map[string]string `yaml:"repositories"`
 }
 
+// gitExec is the function used to run git commands; replaced in tests.
+var gitExec = defaultGitExec
+
+func defaultGitExec(args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 func main() {
-	log.SetFlags(0)
-	log.SetPrefix("git-backup: ")
+	lg := log.New(os.Stderr, "git-backup: ", 0)
+	os.Exit(run(os.Args[1:], lg))
+}
 
-	createConfig := flag.Bool("create-config", false, "write a placeholder config file and exit")
-	flag.Parse()
-
-	cfgPath := expandTilde(configPath)
-
-	if *createConfig {
-		if _, err := os.Stat(cfgPath); err == nil {
-			log.Printf("config already exists at %s", cfgPath)
-			os.Exit(0)
-		}
-		if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
-			log.Fatalf("creating config directory: %v", err)
-		}
-		if err := os.WriteFile(cfgPath, []byte(placeholderConfig), 0o644); err != nil {
-			log.Fatalf("writing config: %v", err)
-		}
-		log.Printf("placeholder config written to %s", cfgPath)
-		os.Exit(0)
+func run(args []string, lg *log.Logger) int {
+	flags := flag.NewFlagSet("git-backup", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	createConfig := flags.Bool("create-config", false, "write a placeholder config file and exit")
+	if err := flags.Parse(args); err != nil {
+		lg.Printf("usage: git-backup [--create-config]")
+		return 1
 	}
 
+	cfgPath := expandTilde(defaultConfigPath)
+
+	if *createConfig {
+		return runCreateConfig(cfgPath, lg)
+	}
+	return runBackup(cfgPath, lg)
+}
+
+func runCreateConfig(cfgPath string, lg *log.Logger) int {
+	if _, err := os.Stat(cfgPath); err == nil {
+		lg.Printf("config already exists at %s", cfgPath)
+		return 0
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		lg.Printf("creating config directory: %v", err)
+		return 1
+	}
+	if err := os.WriteFile(cfgPath, []byte(placeholderConfig), 0o644); err != nil {
+		lg.Printf("writing config: %v", err)
+		return 1
+	}
+	lg.Printf("placeholder config written to %s", cfgPath)
+	return 0
+}
+
+func runBackup(cfgPath string, lg *log.Logger) int {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
-		log.Fatal(err)
+		lg.Print(err)
+		return 1
 	}
 
 	backupDir := expandTilde(cfg.BackupDir)
 	if _, err := os.Stat(backupDir); os.IsNotExist(err) {
-		log.Printf("creating backup directory %s", backupDir)
+		lg.Printf("creating backup directory %s", backupDir)
 		if err := os.MkdirAll(backupDir, 0o755); err != nil {
-			log.Fatalf("creating backup directory: %v", err)
+			lg.Printf("creating backup directory: %v", err)
+			return 1
 		}
 	}
 
 	hadError := false
-	dirs := sortedKeys(cfg.Repositories)
-	for _, dir := range dirs {
+	for _, dir := range sortedKeys(cfg.Repositories) {
 		projects := cfg.Repositories[dir]
 		dirPath := filepath.Join(backupDir, dir)
 		if err := os.MkdirAll(dirPath, 0o755); err != nil {
-			log.Printf("creating directory %s: %v", dirPath, err)
+			lg.Printf("creating directory %s: %v", dirPath, err)
 			hadError = true
 			continue
 		}
@@ -82,15 +110,15 @@ func main() {
 			destPath := filepath.Join(dirPath, project+".git")
 
 			if _, err := os.Stat(destPath); err == nil {
-				log.Printf("updating %s/%s", dir, project)
-				if err := runGit("-C", destPath, "remote", "update"); err != nil {
-					log.Printf("error updating %s/%s: %v", dir, project, err)
+				lg.Printf("updating %s/%s", dir, project)
+				if err := gitExec("-C", destPath, "remote", "update"); err != nil {
+					lg.Printf("error updating %s/%s: %v", dir, project, err)
 					hadError = true
 				}
 			} else {
-				log.Printf("cloning %s/%s from %s", dir, project, url)
-				if err := runGit("clone", "--mirror", url, destPath); err != nil {
-					log.Printf("error cloning %s/%s: %v", dir, project, err)
+				lg.Printf("cloning %s/%s from %s", dir, project, url)
+				if err := gitExec("clone", "--mirror", url, destPath); err != nil {
+					lg.Printf("error cloning %s/%s: %v", dir, project, err)
 					hadError = true
 				}
 			}
@@ -98,8 +126,9 @@ func main() {
 	}
 
 	if hadError {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func loadConfig(path string) (Config, error) {
@@ -141,13 +170,6 @@ func validateConfig(cfg Config) error {
 		}
 	}
 	return nil
-}
-
-func runGit(args ...string) error {
-	cmd := exec.Command("git", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }
 
 func expandTilde(path string) string {

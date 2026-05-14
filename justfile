@@ -4,5 +4,13 @@ build:
 install:
     go install .
 
-check:
-    go vet ./...
+test:
+    go test ./...
+
+lint:
+    golangci-lint run
+
+format:
+    gofmt -w .
+
+check: format lint test
