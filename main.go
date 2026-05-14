@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,16 +20,34 @@ import (
 const defaultConfigPath = "~/.config/git-backup/config.yaml"
 
 const placeholderConfig = `backup-dir: ~/backups/git
+
 repositories:
   personal:
     my-repo: git@github.com:username/my-repo.git
   work:
     work-repo: git@github.com:org/work-repo.git
+
+scan:
+  users:
+    - username
+  orgs:
+    - my-org
 `
+
+type ScanConfig struct {
+	Users []string `yaml:"users"`
+	Orgs  []string `yaml:"orgs"`
+}
 
 type Config struct {
 	BackupDir    string                       `yaml:"backup-dir"`
 	Repositories map[string]map[string]string `yaml:"repositories"`
+	Scan         *ScanConfig                  `yaml:"scan,omitempty"`
+}
+
+type repoInfo struct {
+	Name   string
+	SSHURL string
 }
 
 // gitExec is the function used to run git commands; replaced in tests.
@@ -40,22 +60,88 @@ func defaultGitExec(args ...string) error {
 	return cmd.Run()
 }
 
+// fetchRepos fetches all repos for a GitHub user or org; replaced in tests.
+var fetchRepos = defaultFetchRepos
+
+func defaultFetchRepos(owner string, isOrg bool, token string) ([]repoInfo, error) {
+	var all []repoInfo
+	for page := 1; ; page++ {
+		var apiPath string
+		if isOrg {
+			apiPath = fmt.Sprintf("/orgs/%s/repos", owner)
+		} else {
+			apiPath = fmt.Sprintf("/users/%s/repos", owner)
+		}
+		url := fmt.Sprintf("https://api.github.com%s?type=all&per_page=100&page=%d", apiPath, page)
+
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("GitHub API request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("GitHub API returned %d for %s", resp.StatusCode, url)
+		}
+
+		var pageRepos []struct {
+			Name   string `json:"name"`
+			SSHURL string `json:"ssh_url"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&pageRepos); err != nil {
+			return nil, fmt.Errorf("decoding GitHub API response: %w", err)
+		}
+		for _, r := range pageRepos {
+			all = append(all, repoInfo{Name: r.Name, SSHURL: r.SSHURL})
+		}
+		if len(pageRepos) < 100 {
+			break
+		}
+	}
+	return all, nil
+}
+
+// getGitHubToken returns a GitHub token from GITHUB_TOKEN or `gh auth token`.
+func getGitHubToken() string {
+	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
+		return t
+	}
+	out, err := exec.Command("gh", "auth", "token").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func main() {
 	lg := log.New(os.Stderr, "git-backup: ", 0)
 	os.Exit(run(os.Args[1:], lg))
 }
 
 func run(args []string, lg *log.Logger) int {
+	if len(args) > 0 && args[0] == "scan" {
+		return runScan(expandTilde(defaultConfigPath), lg, os.Stdout)
+	}
+
 	flags := flag.NewFlagSet("git-backup", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	createConfig := flags.Bool("create-config", false, "write a placeholder config file and exit")
 	if err := flags.Parse(args); err != nil {
-		lg.Printf("usage: git-backup [--create-config]")
+		lg.Print("usage: git-backup [--create-config] [scan]")
 		return 1
 	}
 
 	cfgPath := expandTilde(defaultConfigPath)
-
 	if *createConfig {
 		return runCreateConfig(cfgPath, lg)
 	}
@@ -83,6 +169,10 @@ func runBackup(cfgPath string, lg *log.Logger) int {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		lg.Print(err)
+		return 1
+	}
+	if err := validateBackupConfig(cfg); err != nil {
+		lg.Printf("invalid config: %v", err)
 		return 1
 	}
 
@@ -131,6 +221,61 @@ func runBackup(cfgPath string, lg *log.Logger) int {
 	return 0
 }
 
+func runScan(cfgPath string, lg *log.Logger, out io.Writer) int {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		lg.Print(err)
+		return 1
+	}
+	if cfg.Scan == nil || (len(cfg.Scan.Users) == 0 && len(cfg.Scan.Orgs) == 0) {
+		lg.Print("no scan targets configured — add 'scan.users' or 'scan.orgs' to config")
+		return 1
+	}
+
+	managed := map[string]bool{}
+	for _, projects := range cfg.Repositories {
+		for _, url := range projects {
+			managed[url] = true
+		}
+	}
+
+	token := getGitHubToken()
+	hadUnmanaged := false
+	fetchOK := true
+
+	check := func(owner string, isOrg bool) {
+		repos, err := fetchRepos(owner, isOrg, token)
+		if err != nil {
+			lg.Printf("fetching repos for %s: %v", owner, err)
+			fetchOK = false
+			return
+		}
+		for _, r := range repos {
+			if !managed[r.SSHURL] {
+				fmt.Fprintf(out, "%s/%s: %s\n", owner, r.Name, r.SSHURL)
+				hadUnmanaged = true
+			}
+		}
+	}
+
+	for _, user := range cfg.Scan.Users {
+		lg.Printf("scanning user %s", user)
+		check(user, false)
+	}
+	for _, org := range cfg.Scan.Orgs {
+		lg.Printf("scanning org %s", org)
+		check(org, true)
+	}
+
+	if !hadUnmanaged && fetchOK {
+		lg.Print("all repos are managed")
+	}
+	if !fetchOK {
+		return 1
+	}
+	return 0
+}
+
 func loadConfig(path string) (Config, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -147,15 +292,10 @@ func loadConfig(path string) (Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
 	}
-
-	if err := validateConfig(cfg); err != nil {
-		return Config{}, fmt.Errorf("invalid config: %w", err)
-	}
-
 	return cfg, nil
 }
 
-func validateConfig(cfg Config) error {
+func validateBackupConfig(cfg Config) error {
 	if cfg.BackupDir == "" {
 		return errors.New("backup-dir must not be empty")
 	}
