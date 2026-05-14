@@ -267,12 +267,13 @@ func runScan(cfgPath string, lg *log.Logger, out io.Writer) int {
 		check(org, true)
 	}
 
-	if !hadUnmanaged && fetchOK {
-		lg.Print("all repos are managed")
-	}
 	if !fetchOK {
 		return 1
 	}
+	if hadUnmanaged {
+		return 1
+	}
+	lg.Print("all repos are managed")
 	return 0
 }
 

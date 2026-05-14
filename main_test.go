@@ -390,8 +390,8 @@ scan:
 	var logBuf, outBuf bytes.Buffer
 	code := runScan(cfgPath, newLogger(&logBuf), &outBuf)
 
-	if code != 0 {
-		t.Fatalf("expected exit 0, got %d; log: %s", code, logBuf.String())
+	if code != 1 {
+		t.Fatalf("expected exit 1 (new repos found), got %d; log: %s", code, logBuf.String())
 	}
 	out := outBuf.String()
 	if !strings.Contains(out, "alice/unmanaged-repo") {
